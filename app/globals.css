@@ -1,26 +1,23 @@
-@import "tailwindcss";
+/* HeroUI v3 bundles Tailwind v4 + base/theme/components/utilities layers. */
+@import "@heroui/styles/css";
 
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
+/* Tailwind v4 auto-detects sources from the entry file's directory, but we
+   declare them explicitly so classes in every source dir are always scanned. */
+@source "../app/**/*.{ts,tsx}";
+@source "../components/**/*.{ts,tsx}";
+@source "../lib/**/*.{ts,tsx}";
+
+/* Google Sans as the app-wide default font (loaded via <link> in app/layout.tsx).
+   Setting --font-sans makes Tailwind's font-sans utility + preflight default use it. */
+@theme {
+  --font-sans: "Google Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+    Arial, sans-serif;
 }
 
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
-}
-
+html,
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: "Google Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+    Arial, sans-serif;
+  font-optical-sizing: auto;
+  font-variation-settings: "GRAD" 0;
 }

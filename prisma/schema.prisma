@@ -1,0 +1,299 @@
+// Prisma schema for the email-sequence platform.
+// DB: Supabase Postgres. Auth lives in Supabase (auth.users); the local User
+// row mirrors it via supabaseUserId. Every tenant-scoped table carries orgId.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// Prisma 7: connection URLs live in prisma.config.ts; the runtime client uses
+// a driver adapter (see lib/prisma.ts).
+datasource db {
+  provider = "postgresql"
+}
+
+// ─────────────── Tenancy ───────────────
+
+model Organization {
+  id            String   @id @default(cuid())
+  name          String
+  // Per-org sending config. resendApiKey is stored encrypted (see lib/crypto).
+  resendApiKey  String?
+  sendingDomain String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  memberships Membership[]
+  templates   Template[]
+  sequences   Sequence[]
+  contacts    Contact[]
+  tags        ContactTag[]
+  briefs      Brief[]
+  integrations Integration[]
+}
+
+model User {
+  id             String   @id @default(cuid())
+  supabaseUserId String   @unique
+  email          String   @unique
+  name           String?
+  createdAt      DateTime @default(now())
+
+  memberships Membership[]
+}
+
+enum Role {
+  owner
+  editor
+  viewer
+}
+
+model Membership {
+  id     String @id @default(cuid())
+  orgId  String
+  userId String
+  role   Role   @default(owner)
+
+  org  Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  user User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([orgId, userId])
+  @@index([userId])
+}
+
+// ─────────────── Templates ───────────────
+
+enum TemplateType {
+  layout // reusable shell: header/footer/branding
+  content // a full email body of blocks
+}
+
+model Template {
+  id        String       @id @default(cuid())
+  orgId     String
+  name      String
+  type      TemplateType @default(content)
+  // Block-based document (array of blocks) rendered to React Email at send time.
+  blocks    Json
+  thumbnail String?
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+
+  org   Organization   @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  steps SequenceStep[]
+
+  @@index([orgId])
+}
+
+// ─────────────── Sequences ───────────────
+
+enum SequenceStatus {
+  draft
+  active
+  paused
+  archived
+}
+
+model Sequence {
+  id          String         @id @default(cuid())
+  orgId       String
+  name        String
+  description String?
+  status      SequenceStatus @default(draft)
+  // How contacts enter: manual tag list, a Resend audience, etc.
+  audienceRef Json?
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+
+  org         Organization   @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  steps       SequenceStep[]
+  enrollments Enrollment[]
+  briefs      Brief[]
+
+  @@index([orgId])
+}
+
+enum DelayUnit {
+  minutes
+  hours
+  days
+}
+
+model SequenceStep {
+  id         String    @id @default(cuid())
+  sequenceId String
+  order      Int
+  // Delay relative to the previous step (step 0 usually delay 0 = send immediately).
+  delayValue Int       @default(0)
+  delayUnit  DelayUnit @default(days)
+  subject    String
+  preheader  String?
+  // Block document for this email; may start from templateId then be customized.
+  blocks     Json
+  templateId String?
+  // Skip/branch rules, e.g. { skipIf: { event: "opened", ofStep: "prev" } }.
+  conditions Json?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  sequence Sequence  @relation(fields: [sequenceId], references: [id], onDelete: Cascade)
+  template Template? @relation(fields: [templateId], references: [id], onDelete: SetNull)
+  sendLogs SendLog[]
+
+  @@unique([sequenceId, order])
+  @@index([sequenceId])
+}
+
+// ─────────────── Contacts ───────────────
+
+enum ContactSource {
+  manual
+  csv
+  resend_audience
+  webhook
+  api
+}
+
+model Contact {
+  id           String        @id @default(cuid())
+  orgId        String
+  email        String
+  firstName    String?
+  lastName     String?
+  // Arbitrary custom fields used for merge tags + conditions.
+  fields       Json?
+  source       ContactSource @default(manual)
+  subscribed   Boolean       @default(true)
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  org         Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  tags        ContactTagMap[]
+  enrollments Enrollment[]
+
+  @@unique([orgId, email])
+  @@index([orgId])
+}
+
+model ContactTag {
+  id    String @id @default(cuid())
+  orgId String
+  name  String
+
+  org      Organization    @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  contacts ContactTagMap[]
+
+  @@unique([orgId, name])
+  @@index([orgId])
+}
+
+model ContactTagMap {
+  contactId String
+  tagId     String
+
+  contact Contact    @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  tag     ContactTag @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([contactId, tagId])
+  @@index([tagId])
+}
+
+// ─────────────── Enrollment + sending ───────────────
+
+enum EnrollmentStatus {
+  active
+  completed
+  paused
+  unsubscribed
+  failed
+}
+
+model Enrollment {
+  id          String           @id @default(cuid())
+  sequenceId  String
+  contactId   String
+  currentStep Int              @default(0)
+  status      EnrollmentStatus @default(active)
+  // When the next step is due; the cron tick scans for nextRunAt <= now.
+  nextRunAt   DateTime?
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+
+  sequence Sequence  @relation(fields: [sequenceId], references: [id], onDelete: Cascade)
+  contact  Contact   @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  sendLogs SendLog[]
+
+  @@unique([sequenceId, contactId])
+  @@index([status, nextRunAt])
+}
+
+enum SendStatus {
+  queued
+  sent
+  delivered
+  opened
+  clicked
+  bounced
+  complained
+  failed
+}
+
+model SendLog {
+  id              String     @id @default(cuid())
+  enrollmentId    String
+  stepId          String
+  resendMessageId String?
+  status          SendStatus @default(queued)
+  openedAt        DateTime?
+  clickedAt       DateTime?
+  bouncedAt       DateTime?
+  error           String?
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+
+  enrollment Enrollment   @relation(fields: [enrollmentId], references: [id], onDelete: Cascade)
+  step       SequenceStep @relation(fields: [stepId], references: [id], onDelete: Cascade)
+
+  @@index([enrollmentId])
+  @@index([resendMessageId])
+}
+
+// ─────────────── AI briefs ───────────────
+
+model Brief {
+  id            String   @id @default(cuid())
+  orgId         String
+  sequenceId    String?
+  input         Json // the brief the user submitted
+  claudeOutput  Json // structured sequence Claude returned
+  model         String
+  createdAt     DateTime @default(now())
+
+  org      Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  sequence Sequence?    @relation(fields: [sequenceId], references: [id], onDelete: SetNull)
+
+  @@index([orgId])
+}
+
+// ─────────────── External integrations ───────────────
+
+enum IntegrationType {
+  webhook
+  form
+  crm
+}
+
+model Integration {
+  id        String          @id @default(cuid())
+  orgId     String
+  type      IntegrationType
+  name      String
+  // Per-integration secret used to verify inbound webhook signatures.
+  secret    String
+  config    Json?
+  createdAt DateTime        @default(now())
+
+  org Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@index([orgId])
+}

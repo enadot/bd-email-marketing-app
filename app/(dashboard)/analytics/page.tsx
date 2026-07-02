@@ -3,19 +3,17 @@ import { requireOrg } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 
 type Counts = { sent: number; delivered: number; opened: number; clicked: number; bounced: number };
+type StatusMap = Record<string, number>;
 
 // SendLog statuses are terminal-ish snapshots; "sent" here means any successful send.
-async function countsFor(where: object): Promise<Counts> {
-  const grouped = await prisma.sendLog.groupBy({
-    by: ["status"],
-    where,
-    _count: { _all: true },
-  });
-  const map = Object.fromEntries(grouped.map((g) => [g.status, g._count._all]));
+// Pure derivation from a status→count map so the whole page can be served by a
+// single grouped query instead of one query per sequence (the old N+1).
+function countsFromMap(map: StatusMap): Counts {
   const opened = (map.opened ?? 0) + (map.clicked ?? 0); // a click implies an open
   const delivered = (map.delivered ?? 0) + opened;
+  const total = Object.values(map).reduce((a, n) => a + n, 0);
   return {
-    sent: grouped.reduce((a, g) => a + g._count._all, 0) - (map.failed ?? 0),
+    sent: total - (map.failed ?? 0),
     delivered,
     opened,
     clicked: map.clicked ?? 0,
@@ -30,18 +28,47 @@ function pct(n: number, d: number) {
 export default async function AnalyticsPage() {
   const { org } = await requireOrg();
 
-  const sequences = await prisma.sequence.findMany({
-    where: { orgId: org.id },
-    orderBy: { updatedAt: "desc" },
-  });
+  // Three fixed queries regardless of how many sequences exist: the sequence
+  // list, the enrollment→sequence lookup, and one grouped count of every send
+  // log in the org. We fold the counts per sequence (and overall) in memory.
+  const [sequences, enrollments, grouped] = await Promise.all([
+    prisma.sequence.findMany({
+      where: { orgId: org.id },
+      orderBy: { updatedAt: "desc" },
+    }),
+    prisma.enrollment.findMany({
+      where: { sequence: { orgId: org.id } },
+      select: { id: true, sequenceId: true },
+    }),
+    prisma.sendLog.groupBy({
+      by: ["enrollmentId", "status"],
+      where: { enrollment: { sequence: { orgId: org.id } } },
+      _count: { _all: true },
+    }),
+  ]);
 
-  const totals = await countsFor({ enrollment: { sequence: { orgId: org.id } } });
-  const perSequence = await Promise.all(
-    sequences.map(async (s) => ({
-      sequence: s,
-      counts: await countsFor({ enrollment: { sequenceId: s.id } }),
-    })),
+  const sequenceOfEnrollment = new Map(
+    enrollments.map((e) => [e.id, e.sequenceId]),
   );
+
+  const totalStatus: StatusMap = {};
+  const perSequenceStatus = new Map<string, StatusMap>();
+  for (const g of grouped) {
+    const n = g._count._all;
+    totalStatus[g.status] = (totalStatus[g.status] ?? 0) + n;
+
+    const seqId = sequenceOfEnrollment.get(g.enrollmentId);
+    if (!seqId) continue;
+    const rec = perSequenceStatus.get(seqId) ?? {};
+    rec[g.status] = (rec[g.status] ?? 0) + n;
+    perSequenceStatus.set(seqId, rec);
+  }
+
+  const totals = countsFromMap(totalStatus);
+  const perSequence = sequences.map((s) => ({
+    sequence: s,
+    counts: countsFromMap(perSequenceStatus.get(s.id) ?? {}),
+  }));
 
   const cards = [
     { label: "נשלחו", value: totals.sent },

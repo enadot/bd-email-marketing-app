@@ -1,22 +1,31 @@
 "use client";
 
+import { useEffect, useRef } from "react";
 import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import type { Block, EmailSettings } from "@/lib/blocks/schema";
+import { BlockStatic } from "./doc-preview";
 
-// A single block rendered on the editor canvas, draggable + selectable.
+// A single block rendered on the editor canvas: draggable, selectable, and —
+// for text-bearing blocks — editable inline, right on the canvas.
 export function SortableBlock({
   block,
   settings,
   selected,
   onSelect,
   onDelete,
+  onDuplicate,
+  onMove,
+  onPatch,
 }: {
   block: Block;
   settings: EmailSettings;
   selected: boolean;
   onSelect: () => void;
   onDelete: () => void;
+  onDuplicate: () => void;
+  onMove: (dir: -1 | 1) => void;
+  onPatch: (patch: Partial<Block>, opts?: { coalesce?: boolean }) => void;
 }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
     useSortable({ id: block.id });
@@ -27,6 +36,10 @@ export function SortableBlock({
     opacity: isDragging ? 0.5 : 1,
   };
 
+  const inlineEditable =
+    selected &&
+    (block.type === "heading" || block.type === "text" || block.type === "callout");
+
   return (
     <div
       ref={setNodeRef}
@@ -34,78 +47,120 @@ export function SortableBlock({
       onClick={onSelect}
       className={`group relative cursor-pointer rounded-lg border p-2 ${
         selected
-          ? "border-blue-500 ring-2 ring-blue-200"
-          : "border-transparent hover:border-neutral-300"
+          ? "border-blue-500 ring-2 ring-blue-200 dark:ring-blue-900"
+          : "border-transparent hover:border-neutral-300 dark:hover:border-neutral-600"
       }`}
     >
-      <div className="absolute -top-2 left-2 z-10 hidden gap-1 group-hover:flex">
-        <button
-          {...attributes}
-          {...listeners}
-          className="cursor-grab rounded bg-neutral-800 px-2 py-0.5 text-xs text-white"
-          onClick={(e) => e.stopPropagation()}
-          aria-label="גרור"
-        >
+      {/* Hover / selection toolbar */}
+      <div
+        className={`absolute -top-3 left-2 z-10 gap-1 ${selected ? "flex" : "hidden group-hover:flex"}`}
+      >
+        <ToolButton {...attributes} {...listeners} className="cursor-grab" label="גרור">
           ⠿
-        </button>
-        <button
-          onClick={(e) => {
-            e.stopPropagation();
-            onDelete();
-          }}
-          className="rounded bg-red-600 px-2 py-0.5 text-xs text-white"
-          aria-label="מחק"
-        >
+        </ToolButton>
+        <ToolButton label="למעלה" onClick={() => onMove(-1)}>
+          ↑
+        </ToolButton>
+        <ToolButton label="למטה" onClick={() => onMove(1)}>
+          ↓
+        </ToolButton>
+        <ToolButton label="שכפל" onClick={onDuplicate}>
+          ⧉
+        </ToolButton>
+        <ToolButton label="מחק" onClick={onDelete} className="!bg-red-600">
           ✕
-        </button>
+        </ToolButton>
       </div>
-      <BlockPreview block={block} settings={settings} />
+
+      {inlineEditable ? (
+        <InlineText block={block} settings={settings} onPatch={onPatch} />
+      ) : (
+        <BlockStatic block={block} settings={settings} />
+      )}
     </div>
   );
 }
 
-function BlockPreview({ block, settings }: { block: Block; settings: EmailSettings }) {
-  const align = "align" in block ? block.align : "right";
-  switch (block.type) {
-    case "heading":
-      return (
-        <p
-          style={{ textAlign: align, color: settings.textColor }}
-          className={`font-bold ${block.level === 1 ? "text-2xl" : block.level === 2 ? "text-xl" : "text-lg"}`}
-        >
-          {block.text}
-        </p>
-      );
-    case "text":
-      return (
-        <p style={{ textAlign: align, color: settings.textColor }} className="text-sm leading-relaxed">
-          {block.text}
-        </p>
-      );
-    case "image":
-      // eslint-disable-next-line @next/next/no-img-element
-      return <img src={block.src} alt={block.alt} className="mx-auto max-h-40 rounded" />;
-    case "button":
-      return (
-        <div style={{ textAlign: align }}>
-          <span
-            style={{ backgroundColor: settings.brandColor }}
-            className="inline-block rounded-lg px-5 py-2 text-sm font-semibold text-white"
-          >
-            {block.text}
-          </span>
+function ToolButton({
+  label,
+  className = "",
+  onClick,
+  children,
+  ...rest
+}: React.ButtonHTMLAttributes<HTMLButtonElement> & { label: string }) {
+  return (
+    <button
+      type="button"
+      aria-label={label}
+      title={label}
+      onClick={(e) => {
+        e.stopPropagation();
+        onClick?.(e);
+      }}
+      className={`rounded bg-neutral-800 px-2 py-0.5 text-xs text-white hover:bg-neutral-700 ${className}`}
+      {...rest}
+    >
+      {children}
+    </button>
+  );
+}
+
+// Borderless auto-growing textarea that mimics the block's rendered look, so
+// clicking a text block lets you type straight on the canvas.
+function InlineText({
+  block,
+  settings,
+  onPatch,
+}: {
+  block: Extract<Block, { type: "heading" | "text" | "callout" }>;
+  settings: EmailSettings;
+  onPatch: (patch: Partial<Block>, opts?: { coalesce?: boolean }) => void;
+}) {
+  const ref = useRef<HTMLTextAreaElement>(null);
+
+  // Keep height in sync with content.
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    el.style.height = "0px";
+    el.style.height = `${el.scrollHeight}px`;
+  }, [block.text]);
+
+  const typography =
+    block.type === "heading"
+      ? `font-bold ${block.level === 1 ? "text-2xl" : block.level === 2 ? "text-xl" : "text-lg"}`
+      : "text-sm leading-relaxed";
+
+  const color =
+    block.type === "callout"
+      ? block.textColor
+      : (block.color ?? settings.textColor);
+
+  const body = (
+    <textarea
+      ref={ref}
+      value={block.text}
+      onChange={(e) => onPatch({ text: e.target.value } as Partial<Block>, { coalesce: true })}
+      onClick={(e) => e.stopPropagation()}
+      rows={1}
+      style={{
+        textAlign: block.align,
+        color,
+        fontSize: block.type === "text" && block.fontSize ? `${block.fontSize}px` : undefined,
+      }}
+      className={`w-full resize-none overflow-hidden border-none bg-transparent p-0 outline-none focus:ring-0 ${typography}`}
+    />
+  );
+
+  if (block.type === "callout") {
+    return (
+      <div style={{ backgroundColor: block.backgroundColor }} className="rounded-lg px-4 py-3">
+        <div className="flex items-start gap-1.5">
+          {block.emoji && <span className="text-sm">{block.emoji}</span>}
+          {body}
         </div>
-      );
-    case "divider":
-      return <hr className="border-neutral-200" />;
-    case "spacer":
-      return (
-        <div
-          style={{ height: block.height }}
-          className="flex items-center justify-center text-xs text-neutral-300"
-        >
-          רווח {block.height}px
-        </div>
-      );
+      </div>
+    );
   }
+  return body;
 }
